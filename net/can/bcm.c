@@ -487,7 +487,7 @@ static enum hrtimer_restart bcm_tx_timeout_handler(struct hrtimer *hrtimer)
 	 */
 	spin_lock_bh(&op->bcm_tx_lock);
 	tx_ival1 = op->kt_ival1 && (op->count > 0);
-	tx_ival2 = !tx_ival1 && op->kt_ival2;
+	tx_ival2 = !!op->kt_ival2;
 	spin_unlock_bh(&op->bcm_tx_lock);
 
 	if (tx_ival1) {

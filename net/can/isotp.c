@@ -1237,10 +1237,17 @@ static int isotp_release(struct socket *sock)
 						  SINGLE_MASK(so->txid),
 						  isotp_rcv_echo, sk);
 				dev_put(dev);
-				synchronize_rcu();
 			}
 		}
 	}
+
+	/* Always wait for a grace period before touching the timers below.
+	 * A concurrent NETDEV_UNREGISTER may have already unregistered our
+	 * filters and cleared so->bound in isotp_notify() without waiting
+	 * for in-flight isotp_rcv() callers to finish, so this call must not
+	 * be skipped just because so->bound is already 0 here.
+	 */
+	synchronize_rcu();
 
 	hrtimer_cancel(&so->txfrtimer);
 	hrtimer_cancel(&so->txtimer);
@@ -1575,13 +1582,6 @@ static void isotp_notify(struct isotp_sock *so, unsigned long msg,
 			can_rx_unregister(dev_net(dev), dev, so->txid,
 					  SINGLE_MASK(so->txid),
 					  isotp_rcv_echo, sk);
-
-			/* wait for in-flight isotp_rcv() callers to finish
-			 * before clearing so->bound, so that isotp_release()
-			 * cannot observe so->bound == 0 and skip its own
-			 * synchronize_rcu() while a callback is still running
-			 */
-			synchronize_rcu();
 		}
 
 		so->ifindex = 0;

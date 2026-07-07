@@ -1575,6 +1575,13 @@ static void isotp_notify(struct isotp_sock *so, unsigned long msg,
 			can_rx_unregister(dev_net(dev), dev, so->txid,
 					  SINGLE_MASK(so->txid),
 					  isotp_rcv_echo, sk);
+
+			/* wait for in-flight isotp_rcv() callers to finish
+			 * before clearing so->bound, so that isotp_release()
+			 * cannot observe so->bound == 0 and skip its own
+			 * synchronize_rcu() while a callback is still running
+			 */
+			synchronize_rcu();
 		}
 
 		so->ifindex = 0;

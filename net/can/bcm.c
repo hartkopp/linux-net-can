@@ -770,11 +770,6 @@ static void bcm_rx_handler(struct sk_buff *skb, void *data)
 	/* disable timeout */
 	hrtimer_cancel(&op->timer);
 
-	/* save rx timestamp */
-	op->rx_stamp = skb->tstamp;
-	/* save originator for recvfrom() */
-	op->rx_ifindex = skb->dev->ifindex;
-
 	/* snapshot RTR content under lock: op->flags/op->frames may be updated
 	 * concurrently by bcm_rx_setup(). But do not call bcm_can_tx() while
 	 * holding the bcm_rx_update_lock: CAN loopback on echo-capable
@@ -807,6 +802,17 @@ static void bcm_rx_handler(struct sk_buff *skb, void *data)
 	}
 
 	spin_lock_bh(&op->bcm_rx_update_lock);
+
+	/* save rx timestamp and originator for recvfrom() together with
+	 * the content update below, in the same unbroken critical
+	 * section: for an op subscribed on all interfaces (ifindex == 0)
+	 * bcm_rx_handler() can run concurrently on different CPUs for
+	 * frames arriving on different net devices, so a notification
+	 * must never pair this frame's content with another, concurrently
+	 * received frame's timestamp/ifindex
+	 */
+	op->rx_stamp = skb->tstamp;
+	op->rx_ifindex = skb->dev->ifindex;
 
 	if (op->flags & RX_FILTER_ID) {
 		/* the easiest case */

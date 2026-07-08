@@ -1259,6 +1259,7 @@ static int bcm_rx_setup(struct bcm_msg_head *msg_head, struct msghdr *msg,
 	struct bcm_sock *bo = bcm_sk(sk);
 	struct bcm_op *op;
 	int do_rx_register;
+	int new_op = 0;
 	int err = 0;
 
 	if ((msg_head->flags & RX_FILTER_ID) || (!(msg_head->nframes))) {
@@ -1335,8 +1336,17 @@ static int bcm_rx_setup(struct bcm_msg_head *msg_head, struct msghdr *msg,
 		/* free temporary frames / kfree(NULL) is safe */
 		kfree(new_frames);
 
-		/* Only an update -> do not call can_rx_register() */
-		do_rx_register = 0;
+		/* Usually just an update -> no need to call
+		 * can_rx_register() again. However, if this op is bound
+		 * to a specific ifindex and a concurrent NETDEV_UNREGISTER
+		 * already tore down the previous registration
+		 * (op->rx_reg_dev == NULL), the receiver needs to be
+		 * re-registered here so that this update doesn't silently
+		 * stop delivering frames. Ops without a specific ifindex
+		 * never carry a tracked rx_reg_dev and stay registered
+		 * across device life cycles, so they never need this.
+		 */
+		do_rx_register = (ifindex && !op->rx_reg_dev) ? 1 : 0;
 
 	} else {
 		/* insert new BCM operation for the given can_id */
@@ -1403,6 +1413,7 @@ static int bcm_rx_setup(struct bcm_msg_head *msg_head, struct msghdr *msg,
 
 		/* call can_rx_register() */
 		do_rx_register = 1;
+		new_op = 1;
 
 	} /* if ((op = bcm_find_op(&bo->rx_ops, msg_head->can_id, ifindex))) */
 
@@ -1444,7 +1455,10 @@ static int bcm_rx_setup(struct bcm_msg_head *msg_head, struct msghdr *msg,
 				      HRTIMER_MODE_REL_SOFT);
 	}
 
-	/* now we can register for can_ids, if we added a new bcm_op */
+	/* now we can register for can_ids, if we added a new bcm_op
+	 * or need to re-register after a NETDEV_UNREGISTER tore down
+	 * the previous registration of an existing op
+	 */
 	if (do_rx_register) {
 		if (ifindex) {
 			struct net_device *dev;
@@ -1481,13 +1495,19 @@ static int bcm_rx_setup(struct bcm_msg_head *msg_head, struct msghdr *msg,
 					      REGMASK(op->can_id),
 					      bcm_rx_handler, op, "bcm", sk);
 		if (err) {
-			/* this bcm rx op is broken -> remove it */
-			bcm_remove_op(op);
+			if (new_op)
+				/* this bcm rx op is broken -> remove it */
+				bcm_remove_op(op);
+			/* an existing op just stays unregistered until
+			 * the next successful RX_SETUP - it is already
+			 * part of bo->rx_ops and must not be freed here
+			 */
 			return err;
 		}
 
-		/* add this bcm_op to the list of the rx_ops */
-		list_add_rcu(&op->list, &bo->rx_ops);
+		if (new_op)
+			/* add this bcm_op to the list of the rx_ops */
+			list_add_rcu(&op->list, &bo->rx_ops);
 	}
 
 	return msg_head->nframes * op->cfsiz + MHSIZ;
@@ -1711,6 +1731,26 @@ static void bcm_notify(struct bcm_sock *bo, unsigned long msg,
 		list_for_each_entry(op, &bo->rx_ops, list)
 			if (op->rx_reg_dev == dev)
 				bcm_rx_unreg(dev, op);
+
+		/* Stop device specific cyclic transmissions. The op
+		 * itself stays configured (frames, timing, count) so
+		 * the socket keeps its state - but it must be detached
+		 * from the vanishing ifindex: bcm_tx_timeout_handler()
+		 * would otherwise keep re-arming the timer forever, and
+		 * if the ifindex is later reused by a different CAN
+		 * device, bcm_can_tx() would silently start sending the
+		 * cyclic frames to that unrelated device.
+		 */
+		list_for_each_entry(op, &bo->tx_ops, list) {
+			if (op->ifindex != dev->ifindex)
+				continue;
+
+			spin_lock_bh(&op->bcm_tx_lock);
+			op->ifindex = 0;
+			spin_unlock_bh(&op->bcm_tx_lock);
+
+			hrtimer_cancel(&op->timer);
+		}
 
 		/* remove device reference, if this is our bound device */
 		if (bo->bound && bo->ifindex == dev->ifindex) {

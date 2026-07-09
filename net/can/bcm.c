@@ -117,6 +117,17 @@ struct bcm_op {
 	struct hrtimer timer, thrtimer;
 	ktime_t rx_stamp, kt_ival1, kt_ival2, kt_lastmsg;
 	int rx_ifindex;
+	/* first interface an ANYDEV (ifindex == 0) op with an active RX
+	 * timeout and/or throttle timer received a matching frame from.
+	 * Limits frame processing to that single interface until the claim
+	 * is released again in bcm_notify() on NETDEV_UNREGISTER for that
+	 * interface - a mere RX_TIMEOUT does *not* release it, since the
+	 * claimed interface may simply be temporarily silent rather than
+	 * gone; only an actual device removal is a trustworthy signal that
+	 * another interface may take over. Protected by bcm_rx_update_lock,
+	 * 0 means 'not (yet) claimed'.
+	 */
+	int if_detected;
 	int cfsiz;
 	u32 count;
 	u32 nframes;
@@ -664,6 +675,18 @@ static enum hrtimer_restart bcm_rx_timeout_handler(struct hrtimer *hrtimer)
 
 	spin_lock_bh(&op->bcm_rx_update_lock);
 
+	/* Deliberately do NOT release an ANYDEV op's if_detected claim
+	 * (see bcm_rx_handler()) here: a timeout only means the claimed
+	 * interface has been silent for one period, not that it is gone -
+	 * it may resume at any time. Releasing the claim on every timeout
+	 * would let a different, unrelated interface race for and steal it
+	 * right as the real source resumes, reopening the very race
+	 * if_detected exists to prevent, and would misattribute a
+	 * subsequent RX_ANNOUNCE_RESUME notification to the wrong
+	 * interface. The claim is only released in bcm_notify() once
+	 * NETDEV_UNREGISTER confirms the interface is actually gone.
+	 */
+
 	/* if user wants to be informed, when cyclic CAN-Messages come back */
 	if ((op->flags & RX_ANNOUNCE_RESUME) && op->last_frames) {
 		/* clear received CAN frames to indicate 'nothing received' */
@@ -776,6 +799,39 @@ static void bcm_rx_handler(struct sk_buff *skb, void *data)
 			return;
 	}
 
+	/* An ANYDEV (ifindex == 0) op with an active RX timeout and/or
+	 * throttle timer can only track a single source interface - mixing
+	 * frames from several interfaces has no defined semantics for the
+	 * timeout/throttle state (see also bcm_notify(), which releases the
+	 * claim again once NETDEV_UNREGISTER confirms it is gone - a mere
+	 * RX_TIMEOUT does not release it). Claim the first interface that
+	 * delivers a matching frame and reject frames from any other
+	 * interface right here, in a dedicated critical section
+	 * before hrtimer_cancel() below can touch op->timer at all. This
+	 * guarantees that a rejected frame never disturbs the claimed
+	 * interface's watchdog, without having to compensate for that
+	 * afterwards. RTR-mode ops are excluded by checking RX_RTR_FRAME
+	 * directly, independent of kt_ival1/kt_ival2: they are expected to
+	 * answer from any interface and never call bcm_rx_starttimer(), but
+	 * kt_ival1/kt_ival2 may still briefly hold a stale non-zero value
+	 * from an earlier non-RTR configuration of this op while
+	 * bcm_rx_setup() is updating it (op->flags and the timer values are
+	 * set in separate critical sections there).
+	 */
+	if (!op->ifindex && !(op->flags & RX_RTR_FRAME) &&
+	    (op->kt_ival1 || op->kt_ival2)) {
+		bool foreign;
+
+		spin_lock_bh(&op->bcm_rx_update_lock);
+		if (!op->if_detected)
+			op->if_detected = skb->dev->ifindex;
+		foreign = op->if_detected != skb->dev->ifindex;
+		spin_unlock_bh(&op->bcm_rx_update_lock);
+
+		if (foreign)
+			return;
+	}
+
 	/* disable timeout */
 	hrtimer_cancel(&op->timer);
 
@@ -811,9 +867,10 @@ static void bcm_rx_handler(struct sk_buff *skb, void *data)
 	}
 
 	/* save rx timestamp and originator for recvfrom() under lock.
-	 * For an op subscribed on all interfaces (ifindex == 0)
-	 * bcm_rx_handler() can run concurrently on different CPUs so
-	 * the CAN content and the meta data must be bundled correctly.
+	 * For an op subscribed on all interfaces (ifindex == 0) without
+	 * an active timeout/throttle timer, bcm_rx_handler() can still run
+	 * concurrently on different CPUs, so the CAN content and the meta
+	 * data must be bundled correctly.
 	 */
 	op->rx_stamp = skb->tstamp;
 	op->rx_ifindex = skb->dev->ifindex;
@@ -1428,7 +1485,15 @@ static int bcm_rx_setup(struct bcm_msg_head *msg_head, struct msghdr *msg,
 	/* check flags */
 
 	if (op->flags & RX_RTR_FRAME) {
-		/* no timers in RTR-mode */
+		/* no timers in RTR-mode. ival1/ival2/kt_ival1/kt_ival2 are
+		 * intentionally left untouched here (may still carry a
+		 * value from an earlier non-RTR configuration of this op):
+		 * bcm_rx_handler()'s ANYDEV claim check is gated on
+		 * RX_RTR_FRAME itself, independent of these values, and
+		 * BCM's documented STARTTIMER-without-SETTIMER semantics
+		 * (re-arm the previously configured interval) rely on
+		 * kt_ival1/kt_ival2 surviving a temporary RTR-mode excursion.
+		 */
 		hrtimer_cancel(&op->thrtimer);
 		hrtimer_cancel(&op->timer);
 	} else {
@@ -1739,9 +1804,26 @@ static void bcm_notify(struct bcm_sock *bo, unsigned long msg,
 		lock_sock(sk);
 
 		/* rx_ops: remove device specific receive entries */
-		list_for_each_entry(op, &bo->rx_ops, list)
+		list_for_each_entry(op, &bo->rx_ops, list) {
 			if (op->rx_reg_dev == dev)
 				bcm_rx_unreg(dev, op);
+
+			/* release an ANYDEV op's claim (see bcm_rx_handler())
+			 * on this vanishing interface: NETDEV_UNREGISTER is
+			 * the only trustworthy signal that the interface is
+			 * actually gone (as opposed to a mere RX_TIMEOUT,
+			 * which does not release the claim), so a remaining
+			 * interface can take over right away instead of
+			 * being stuck forever on a claim to a device that
+			 * will never send another frame.
+			 */
+			if (!op->ifindex) {
+				spin_lock_bh(&op->bcm_rx_update_lock);
+				if (op->if_detected == dev->ifindex)
+					op->if_detected = 0;
+				spin_unlock_bh(&op->bcm_rx_update_lock);
+			}
+		}
 
 		/* tx_ops: stop device specific cyclic transmissions on the
 		 * vanishing ifindex. Cancelling the timer is enough to stop

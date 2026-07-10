@@ -980,11 +980,8 @@ static int isotp_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 			goto err_event_drop;
 	}
 
-	/* re-check after a potential wait: so->bound is only validated once
-	 * above, so a wakeup via isotp_notify() on NETDEV_UNREGISTER (or the
-	 * regular tx timeout path) may have flipped it to 0 - or rebound the
-	 * socket to another interface - while this call was parked here
-	 */
+	/* so->bound is only checked once above - a wakeup may have
+	 * unbound/rebound the socket meanwhile, so re-validate it */
 	if (!so->bound) {
 		err = -EADDRNOTAVAIL;
 		goto err_out_drop;
@@ -1608,24 +1605,16 @@ static void isotp_notify(struct isotp_sock *so, unsigned long msg,
 		so->bound  = 0;
 		so->dev = NULL;
 
-		/* Wait for a grace period so that an isotp_rcv()/isotp_rcv_echo()
-		 * call already in flight on the vanishing interface cannot
-		 * re-arm a timer - or directly send a consecutive frame via
-		 * isotp_rcv_echo() - after the tx/rx state below has been
-		 * reset. Without this, stale tx data could otherwise leak
-		 * onto a different interface this socket gets rebound to.
-		 * synchronize_net() picks the expedited RCU variant here, as
-		 * this notifier callback runs with rtnl_lock held.
-		 */
+		/* wait for in-flight isotp_rcv()/isotp_rcv_echo() calls to finish so
+		 * they can't leak stale tx data via a re-armed timer after a rebind;
+		 * synchronize_net() is expedited here since rtnl_lock is held */
 		synchronize_net();
 
 		hrtimer_cancel(&so->txfrtimer);
 		hrtimer_cancel(&so->txtimer);
 		hrtimer_cancel(&so->rxtimer);
 
-		/* reset tx/rx state machines so that a subsequent bind() to
-		 * another interface starts from a clean state
-		 */
+		/* reset tx/rx state so a following bind() starts clean */
 		so->tx.state = ISOTP_IDLE;
 		so->rx.state = ISOTP_IDLE;
 		so->cfecho = 0;

@@ -378,6 +378,15 @@ static int isotp_rcv_fc(struct isotp_sock *so, struct canfd_frame *cf, int ae)
 
 	hrtimer_cancel(&so->txtimer);
 
+	/* isotp_tx_timer_handler() may have raced us for so->tx.state while
+	 * hrtimer_cancel() above waited for it to finish, already reporting
+	 * the tx error and resetting the state; don't resume a tx job that
+	 * has already been given up on.
+	 */
+	if (so->tx.state != ISOTP_WAIT_FC &&
+	    so->tx.state != ISOTP_WAIT_FIRST_FC)
+		return 1;
+
 	if ((cf->len < ae + FC_CONTENT_SZ) ||
 	    ((so->opt.flags & ISOTP_CHECK_PADDING) &&
 	     check_pad(so, cf, ae + FC_CONTENT_SZ, so->opt.rxpad_content))) {
@@ -576,6 +585,14 @@ static int isotp_rcv_cf(struct sock *sk, struct canfd_frame *cf, int ae,
 	}
 
 	hrtimer_cancel(&so->rxtimer);
+
+	/* isotp_rx_timer_handler() may have raced us for so->rx.state
+	 * while hrtimer_cancel() above waited for it to finish, already
+	 * reporting ETIMEDOUT and resetting the reception; don't process
+	 * this CF into a reassembly that has already been given up on.
+	 */
+	if (so->rx.state != ISOTP_WAIT_DATA)
+		return 1;
 
 	/* CFs are never longer than the FF */
 	if (cf->len > so->rx.ll_dl)
@@ -881,6 +898,14 @@ static void isotp_rcv_echo(struct sk_buff *skb, void *data)
 	/* local echo skb with consecutive frame has been consumed */
 	so->cfecho = 0;
 
+	/* isotp_tx_timer_handler() may have raced us for so->tx.state while
+	 * hrtimer_cancel() above waited for it to finish, already reporting
+	 * the tx error and resetting the state; don't resume a tx job that
+	 * has already been given up on.
+	 */
+	if (so->tx.state != ISOTP_SENDING)
+		return;
+
 	if (so->tx.idx >= so->tx.len) {
 		/* we are done */
 		so->tx.state = ISOTP_IDLE;
@@ -1143,8 +1168,7 @@ static int isotp_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 	return size;
 
 err_event_drop:
-	/* got signal: force tx state machine to be idle */
-	so->tx.state = ISOTP_IDLE;
+	/* got signal: force tx state machine to be ISOTP_IDLE */
 	hrtimer_cancel(&so->txfrtimer);
 	hrtimer_cancel(&so->txtimer);
 err_out_drop:

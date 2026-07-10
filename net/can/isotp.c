@@ -980,6 +980,16 @@ static int isotp_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 			goto err_event_drop;
 	}
 
+	/* re-check after a potential wait: so->bound is only validated once
+	 * above, so a wakeup via isotp_notify() on NETDEV_UNREGISTER (or the
+	 * regular tx timeout path) may have flipped it to 0 - or rebound the
+	 * socket to another interface - while this call was parked here
+	 */
+	if (!so->bound) {
+		err = -EADDRNOTAVAIL;
+		goto err_out_drop;
+	}
+
 	/* PDU size > default => try max_pdu_size */
 	if (size > so->tx.buflen && so->tx.buflen < max_pdu_size) {
 		u8 *newbuf = kmalloc(max_pdu_size, GFP_KERNEL);

@@ -1597,6 +1597,28 @@ static void isotp_notify(struct isotp_sock *so, unsigned long msg,
 		so->ifindex = 0;
 		so->bound  = 0;
 		so->dev = NULL;
+
+		/* Wait for a grace period so that an isotp_rcv()/isotp_rcv_echo()
+		 * call already in flight on the vanishing interface cannot
+		 * re-arm a timer - or directly send a consecutive frame via
+		 * isotp_rcv_echo() - after the tx/rx state below has been
+		 * reset. Without this, stale tx data could otherwise leak
+		 * onto a different interface this socket gets rebound to.
+		 */
+		synchronize_rcu();
+
+		hrtimer_cancel(&so->txfrtimer);
+		hrtimer_cancel(&so->txtimer);
+		hrtimer_cancel(&so->rxtimer);
+
+		/* reset tx/rx state machines so that a subsequent bind() to
+		 * another interface starts from a clean state
+		 */
+		so->tx.state = ISOTP_IDLE;
+		so->rx.state = ISOTP_IDLE;
+		so->cfecho = 0;
+		wake_up_interruptible(&so->wait);
+
 		release_sock(sk);
 
 		sk->sk_err = ENODEV;

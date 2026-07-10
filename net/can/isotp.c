@@ -1604,8 +1604,10 @@ static void isotp_notify(struct isotp_sock *so, unsigned long msg,
 		 * isotp_rcv_echo() - after the tx/rx state below has been
 		 * reset. Without this, stale tx data could otherwise leak
 		 * onto a different interface this socket gets rebound to.
+		 * synchronize_net() picks the expedited RCU variant here, as
+		 * this notifier callback runs with rtnl_lock held.
 		 */
-		synchronize_rcu();
+		synchronize_net();
 
 		hrtimer_cancel(&so->txfrtimer);
 		hrtimer_cancel(&so->txtimer);

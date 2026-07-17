@@ -794,6 +794,7 @@ static void isotp_send_cframe(struct isotp_sock *so)
 	struct canfd_frame *cf;
 	int can_send_ret;
 	int ae = (so->opt.flags & CAN_ISOTP_EXTEND_ADDR) ? 1 : 0;
+	u32 old_cfecho;
 
 	dev = dev_get_by_index(sock_net(sk), so->ifindex);
 	if (!dev)
@@ -830,12 +831,15 @@ static void isotp_send_cframe(struct isotp_sock *so)
 	skb->dev = dev;
 	can_skb_set_owner(skb, sk);
 
-	/* cfecho should have been zero'ed by init/isotp_rcv_echo() */
-	if (so->cfecho)
-		pr_notice_once("can-isotp: cfecho is %08X != 0\n", so->cfecho);
+	/* zero'ed by init/isotp_rcv_echo(); reached lock-free via
+	 * isotp_txfr_timer_handler() too, so use READ_ONCE()/WRITE_ONCE()
+	 */
+	old_cfecho = READ_ONCE(so->cfecho);
+	if (old_cfecho)
+		pr_notice_once("can-isotp: cfecho is %08X != 0\n", old_cfecho);
 
 	/* set consecutive frame echo tag */
-	so->cfecho = *(u32 *)cf->data;
+	WRITE_ONCE(so->cfecho, *(u32 *)cf->data);
 
 	/* send frame with local echo enabled */
 	can_send_ret = can_send(skb, 1);
@@ -950,6 +954,9 @@ out_unlock:
  * cancelled under so->rx_lock elsewhere, so this must stay lock-free to
  * avoid deadlocking with that; uses so->tx_gen instead to avoid tainting
  * a new transfer with an error from the one that just timed out.
+ *
+ * so->tx_gen is bumped before so->tx.state in isotp_sendmsg(), paired
+ * with smp_wmb() - cmpxchg()'s full ordering makes the re-read below safe.
  */
 static enum hrtimer_restart isotp_tx_timeout(struct isotp_sock *so)
 {
@@ -1007,7 +1014,7 @@ static enum hrtimer_restart isotp_txfr_timer_handler(struct hrtimer *hrtimer)
 		      HRTIMER_MODE_REL_SOFT);
 
 	/* cfecho should be consumed by isotp_rcv_echo() here */
-	if (so->tx.state == ISOTP_SENDING && !so->cfecho)
+	if (READ_ONCE(so->tx.state) == ISOTP_SENDING && !READ_ONCE(so->cfecho))
 		isotp_send_cframe(so);
 
 	return HRTIMER_NORESTART;
@@ -1029,7 +1036,7 @@ static int isotp_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 	int off;
 	int err;
 
-	if (!so->bound || so->tx.state == ISOTP_SHUTDOWN)
+	if (!so->bound || READ_ONCE(so->tx.state) == ISOTP_SHUTDOWN)
 		return -EADDRNOTAVAIL;
 
 	/* claim the socket under so->rx_lock: this serializes the claim
@@ -1046,24 +1053,28 @@ static int isotp_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 		if (msg->msg_flags & MSG_DONTWAIT)
 			return -EAGAIN;
 
-		if (so->tx.state == ISOTP_SHUTDOWN)
+		if (READ_ONCE(so->tx.state) == ISOTP_SHUTDOWN)
 			return -EADDRNOTAVAIL;
 
 		/* wait for complete transmission of current pdu */
 		err = wait_event_interruptible(so->wait,
-					       so->tx.state == ISOTP_IDLE);
+					       so->tx.state == ISOTP_IDLE ||
+					       so->tx.state == ISOTP_SHUTDOWN);
 		if (err)
 			return err;
 	}
 
+	/* txfrtimer's callback re-arms echotimer lock-free: drain it first */
+	hrtimer_cancel(&so->txfrtimer);
+	hrtimer_cancel(&so->txtimer);
+	hrtimer_cancel(&so->echotimer);
+
 	/* new transfer: bump so->tx_gen and drain the old one's timers,
 	 * still under the so->rx_lock we just claimed the socket with
 	 */
-	WRITE_ONCE(so->tx.state, ISOTP_SENDING);
 	WRITE_ONCE(so->tx_gen, READ_ONCE(so->tx_gen) + 1);
-	hrtimer_cancel(&so->txtimer);
-	hrtimer_cancel(&so->echotimer);
-	hrtimer_cancel(&so->txfrtimer);
+	smp_wmb(); /* pairs with the cmpxchg() in isotp_tx_timeout() */
+	WRITE_ONCE(so->tx.state, ISOTP_SENDING);
 	so->cfecho = 0;
 	spin_unlock_bh(&so->rx_lock);
 
@@ -1230,9 +1241,17 @@ static int isotp_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 
 	if (wait_tx_done) {
 		/* wait for complete transmission of current pdu */
-		err = wait_event_interruptible(so->wait, so->tx.state == ISOTP_IDLE);
+		err = wait_event_interruptible(so->wait,
+						so->tx.state == ISOTP_IDLE ||
+						so->tx.state == ISOTP_SHUTDOWN);
 		if (err)
 			goto err_event_drop;
+
+		if (so->tx.state == ISOTP_SHUTDOWN) {
+			/* isotp_release() has taken over the claim */
+			err = -EADDRNOTAVAIL;
+			goto err_event_drop;
+		}
 
 		err = sock_error(sk);
 		if (err)
@@ -1246,7 +1265,7 @@ err_out_drop:
 	spin_lock_bh(&so->rx_lock);
 	goto err_out_drop_locked;
 err_event_drop:
-	/* interrupted waiting on our own transfer - drain its timers */
+	/* interrupted or shut down while waiting on our own transfer */
 	spin_lock_bh(&so->rx_lock);
 	hrtimer_cancel(&so->txfrtimer);
 	hrtimer_cancel(&so->txtimer);
@@ -1254,7 +1273,10 @@ err_event_drop:
 err_out_drop_locked:
 	/* release the claim; so->rx_lock still held from above */
 	so->cfecho = 0;
-	so->tx.state = ISOTP_IDLE;
+
+	/* only claim to IDLE if isotp_release() has not taken over */
+	if (so->tx.state != ISOTP_SHUTDOWN)
+		so->tx.state = ISOTP_IDLE;
 	spin_unlock_bh(&so->rx_lock);
 	wake_up_interruptible(&so->wait);
 
@@ -1332,6 +1354,9 @@ static int isotp_release(struct socket *sock)
 	so->tx.state = ISOTP_SHUTDOWN;
 	spin_unlock_bh(&so->rx_lock);
 	so->rx.state = ISOTP_IDLE;
+
+	/* forced SHUTDOWN may have skipped IDLE (gave up on a signal) */
+	wake_up_interruptible(&so->wait);
 
 	spin_lock(&isotp_notifier_lock);
 	while (isotp_busy_notifier == so) {
@@ -1847,7 +1872,7 @@ static __poll_t isotp_poll(struct file *file, struct socket *sock, poll_table *w
 	poll_wait(file, &so->wait, wait);
 
 	/* Check for false positives due to TX state */
-	if ((mask & EPOLLWRNORM) && (so->tx.state != ISOTP_IDLE))
+	if ((mask & EPOLLWRNORM) && (READ_ONCE(so->tx.state) != ISOTP_IDLE))
 		mask &= ~(EPOLLOUT | EPOLLWRNORM);
 
 	return mask;

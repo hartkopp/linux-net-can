@@ -1273,6 +1273,16 @@ static int isotp_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 			       __func__, ERR_PTR(err));
 
 		spin_lock_bh(&so->rx_lock);
+
+		/* new transfer already claimed by a concurrent completion,
+		 * timeout or sendmsg() while we were stuck in can_send()?
+		 */
+		if (READ_ONCE(so->tx_gen) != my_gen) {
+			/* don't touch timers and state of the new transfer */
+			spin_unlock_bh(&so->rx_lock);
+			return err;
+		}
+
 		/* no transmission -> no timeout monitoring */
 		hrtimer_cancel(tx_hrt);
 		goto err_out_drop_locked;
@@ -1302,6 +1312,15 @@ static int isotp_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 
 			if (isotp_get_tx_gen(result) == my_gen)
 				tx_err = isotp_get_tx_err(result);
+
+			/* whichever generation set sk_err paired it with
+			 * tx_result, so it must be drained here - leaving it
+			 * pending would let it falsely fail (or falsely be
+			 * swallowed by) a later, unrelated sendmsg() call
+			 */
+			err = sock_error(sk);
+			if (!tx_err && err)
+				tx_err = -err;
 
 			return tx_err ? -tx_err : size;
 		}

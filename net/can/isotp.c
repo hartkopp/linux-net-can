@@ -233,6 +233,22 @@ static int isotp_get_tx_result(struct isotp_sock *so, u32 gen)
 	return -(isotp_get_tx_err(result));
 }
 
+/* true once 'gen's transfer is no longer the active one: it completed
+ * (tx.state observed IDLE), the socket is shutting down, or a newer
+ * generation has since been claimed. tx.state is always read first, with
+ * an acquire load, so any tx_gen/tx_result read a caller makes afterwards
+ * is guaranteed to see at least as much as the state transition published -
+ * see the smp_wmb() pairing in isotp_sendmsg()'s claim and in the
+ * tx_result writers.
+ */
+static bool isotp_tx_gen_done(struct isotp_sock *so, u32 gen)
+{
+	u32 state = smp_load_acquire(&so->tx.state);
+
+	return state == ISOTP_IDLE || state == ISOTP_SHUTDOWN ||
+	       READ_ONCE(so->tx_gen) != gen;
+}
+
 static inline struct isotp_sock *isotp_sk(const struct sock *sk)
 {
 	return (struct isotp_sock *)sk;
@@ -1022,15 +1038,20 @@ out_unlock:
  * Shared by so->txtimer's and so->echotimer's callbacks. Both timers get
  * cancelled under so->rx_lock elsewhere, so this must stay lock-free.
  *
- * so->tx_gen is incremented before so->tx.state in isotp_sendmsg(), paired
- * with smp_wmb() - cmpxchg()'s full ordering makes sure 'gen' below is
- * always the generation that old_state/the cmpxchg() actually claimed.
+ * isotp_sendmsg() publishes a new claim as: write tx_result[] sentinel,
+ * WRITE_ONCE(tx_gen), smp_wmb(), WRITE_ONCE(tx.state, SENDING). To always
+ * pair 'gen' below with the generation that old_state/the cmpxchg() below
+ * actually claimed, tx.state must be read first (with an acquire load) and
+ * tx_gen only afterwards: reading tx_gen first would let a weakly ordered
+ * CPU observe a fresh tx.state for a newly claimed generation while gen
+ * still holds the previous generation's value. cmpxchg() only orders its
+ * own read-modify-write, not the two loads that precede it.
  */
 static enum hrtimer_restart isotp_tx_timeout(struct isotp_sock *so)
 {
 	struct sock *sk = &so->sk;
+	u32 old_state = smp_load_acquire(&so->tx.state);
 	u32 gen = READ_ONCE(so->tx_gen);
-	u32 old_state = READ_ONCE(so->tx.state);
 
 	/* don't handle timeouts in IDLE or SHUTDOWN state */
 	if (old_state == ISOTP_IDLE || old_state == ISOTP_SHUTDOWN)
@@ -1143,7 +1164,12 @@ static int isotp_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 	my_gen = isotp_inc_tx_gen(READ_ONCE(so->tx_gen));
 	isotp_set_tx_result(so, my_gen, ECOMM); /* prevent stale slot matching */
 	WRITE_ONCE(so->tx_gen, my_gen);
-	smp_wmb(); /* pairs with the cmpxchg() in isotp_tx_timeout() */
+	/* pairs with the smp_load_acquire() of tx.state in isotp_tx_timeout()
+	 * and in isotp_tx_gen_done(): both read tx.state before tx_gen, so
+	 * this wmb guarantees neither can observe the state flip to
+	 * ISOTP_SENDING before tx_gen/tx_result above are visible
+	 */
+	smp_wmb();
 	WRITE_ONCE(so->tx.state, ISOTP_SENDING);
 	WRITE_ONCE(so->cfecho, 0);
 	spin_unlock_bh(&so->rx_lock);
@@ -1328,21 +1354,21 @@ static int isotp_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 		 * - concurrent sendmsg() claiming a new transfer
 		 * - complete transmission of current PDU
 		 * - shutdown state change in isotp_release()
-		 * A tx_gen mismatch short-circuits past the acquire below, but
-		 * isotp_get_tx_result() tag-checks every read, so a stale one
-		 * is always safely rejected, never mistaken for another result.
+		 * isotp_tx_gen_done() always reads tx.state (acquire) before
+		 * tx_gen, so a tx_gen mismatch is never observed ahead of the
+		 * tx_result[]/tx.state write that publishes it.
 		 */
 		err = wait_event_interruptible(so->wait,
-					       READ_ONCE(so->tx_gen) != my_gen ||
-					       /* read pairs with the tx_result writers, SMP-safe */
-					       smp_load_acquire(&so->tx.state) == ISOTP_IDLE ||
-					       READ_ONCE(so->tx.state) == ISOTP_SHUTDOWN);
+					       isotp_tx_gen_done(so, my_gen));
 		if (err)
 			goto err_event_drop;
 
-		/* still our claim, but isotp_release() force-shut it down */
-		if (READ_ONCE(so->tx_gen) == my_gen &&
-		    READ_ONCE(so->tx.state) == ISOTP_SHUTDOWN) {
+		/* still our claim, but isotp_release() force-shut it down.
+		 * Re-read (same ordering as isotp_tx_gen_done()) since the
+		 * condition above may no longer hold by the time we get here.
+		 */
+		if (smp_load_acquire(&so->tx.state) == ISOTP_SHUTDOWN &&
+		    READ_ONCE(so->tx_gen) == my_gen) {
 			err = -EADDRNOTAVAIL;
 			goto err_event_drop;
 		}
@@ -1350,9 +1376,19 @@ static int isotp_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 		/* either our own claim completed normally, or so->tx_gen has
 		 * since moved on to a new transfer - either way, our result
 		 * is whatever isotp_get_tx_result() finds recorded for
-		 * my_gen's so->tx_result[] slot
+		 * my_gen's so->tx_result[] slot. The acquire load above
+		 * orders this read after the state transition that
+		 * published it.
 		 */
 		err = isotp_get_tx_result(so, my_gen);
+
+		/* our result came from tx_result[] above, not from sk_err -
+		 * drain it so a WAIT_TX_DONE caller never leaves a stale
+		 * error latched for an unrelated later poll()/getsockopt
+		 * (SO_ERROR) on this socket
+		 */
+		sock_error(sk);
+
 		return err ? err : size;
 	}
 
